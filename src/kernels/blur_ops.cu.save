@@ -1,9 +1,7 @@
 #include <cuda_runtime.h>
 #include <stdio.h>     
-#include <math.h>
 
 unsigned char *d_red, *d_green, *d_blue;
-float *d_filter;
 float *d_filter_vertical, *d_filter_horizontal;
 uchar4 *d_inputImageRGBA__;
 uchar4 *d_outputImageRGBA__;
@@ -11,8 +9,10 @@ float *h_filter__;
 
 __global__ void gaussian_blur(const unsigned char* const inputChannel,
                    unsigned char* const outputChannel,
-                   int numRows, int numCols, const float* const filter_vertical, const int filterWidth) {
+                   int numRows, int numCols, const float* const filter, const int filterWidth) {
   
+//	__shared__ float d_filter[filterWidth * filterWidth];	
+
 	int col = blockIdx.x * blockDim.x + threadIdx.x;
 	int row = blockIdx.y * blockDim.y + threadIdx.y;
 	if ( col >= numCols || row >= numRows )
@@ -22,45 +22,19 @@ __global__ void gaussian_blur(const unsigned char* const inputChannel,
 	
 	//For every value in the filter around the pixel (c, r)
 	for (int filter_r = -filterWidth/2; filter_r <= filterWidth/2; ++filter_r) {
+		for (int filter_c = -filterWidth/2; filter_c <= filterWidth/2; ++filter_c) {
 			//Find the global image position for this filter position
 			//clamp to boundary of the image
 			int image_r = min(max(row + filter_r, 0), static_cast<int>(numRows - 1));
-
-			float image_value = static_cast<float>(inputChannel[image_r * numCols + col]);
-			float filter_value = filter_vertical[(filter_r + filterWidth/2)];
-
-			result += image_value * filter_value;
-		
-	}
-	outputChannel[row * numCols + col] = result;
-
-}
-
-__global__ void gaussian_blur2(const unsigned char* const inputChannel,
-                   unsigned char* const outputChannel,
-                   int numRows, int numCols,const float* const filter_horizontal, const int filterWidth) {
-  
-	int col = blockIdx.x * blockDim.x + threadIdx.x;
-	int row = blockIdx.y * blockDim.y + threadIdx.y;
-	if ( col >= numCols || row >= numRows )
-		return;
-
-	float result = 0.f;
-
-	//For every value in the filter around the pixel (c, r)
-	for (int filter_c = -filterWidth/2; filter_c <= filterWidth/2; ++filter_c) {
-			//Find the global image position for this filter position
-			//clamp to boundary of the image
 			int image_c = min(max(col + filter_c, 0), static_cast<int>(numCols - 1));
 
-			float image_value = static_cast<float>(inputChannel[image_c * numRows + row]);
-			float filter_value = filter_horizontal[(filter_c + filterWidth/2)];
+			float image_value = static_cast<float>(inputChannel[image_r * numCols + image_c]);
+			float filter_value = filter[(filter_r + filterWidth/2) * filterWidth + filter_c + filterWidth/2];
 
 			result += image_value * filter_value;
-		
+		}
 	}
 	outputChannel[row * numCols + col] = result;
-
 }
 
 __global__ void separateChannels(const uchar4* const inputImageRGBA,
@@ -111,18 +85,16 @@ __global__ void recombineChannels(const unsigned char* const redChannel,
 
 
 
-void allocateMemoryAndCopyToGPU(const size_t numRowsImage, const size_t numColsImage, 
-					const float* const h_filter_vertical, const float* const h_filter_horizontal, const size_t filterWidth) { 
+void allocateMemoryAndCopyToGPU(const size_t numRowsImage, const size_t numColsImage, const float* const h_filter, const size_t filterWidth) { 
 	//allocate memory for the three different channels
   	//original
 	cudaMalloc(&d_red,   sizeof(unsigned char) * numRowsImage * numColsImage);
 	cudaMalloc(&d_green, sizeof(unsigned char) * numRowsImage * numColsImage);
 	cudaMalloc(&d_blue,  sizeof(unsigned char) * numRowsImage * numColsImage);
 
-	cudaMalloc(&d_filter_vertical, sizeof(float)*filterWidth);
-	cudaMalloc(&d_filter_horizontal, sizeof(float)*filterWidth);
-	cudaMemcpy(d_filter_vertical,h_filter_vertical,sizeof(float)*filterWidth,cudaMemcpyHostToDevice);
-	cudaMemcpy(d_filter_horizontal,h_filter_horizontal,sizeof(float)*filterWidth,cudaMemcpyHostToDevice);
+	//Allocate memory for the filter on the GPU
+	cudaMalloc(&d_filter, sizeof(float)*filterWidth*filterWidth);
+	cudaMemcpy(d_filter,h_filter,sizeof(float)*filterWidth*filterWidth,cudaMemcpyHostToDevice);
 }
 
 void cleanup() {
@@ -133,40 +105,37 @@ void cleanup() {
 }
 
 
-void setFilter(float **h_filter_vertical, float **h_filter_horizontal, int *filterWidth, int blurKernelWidth, float blurKernelSigma) { 
+void setFilter(float **h_filter, int *filterWidth, int blurKernelWidth, float blurKernelSigma) { 
 	//Normally blurKernelWidth = 9 and blurKernelSigma = 2.0 
-	*h_filter_vertical = new float[blurKernelWidth];
-	*h_filter_horizontal = new float[blurKernelWidth];
+	*h_filter = new float[blurKernelWidth * blurKernelWidth];
 	*filterWidth = blurKernelWidth;
-
 	float filterSum = 0.f; //for normalization
 
 	for (int r = -blurKernelWidth/2; r <= blurKernelWidth/2; ++r) {
-	  		float filterValue = expf( -(float)(r * r ) / (2.f * blurKernelSigma * blurKernelSigma));
-	  		(*h_filter_vertical)[(r + blurKernelWidth/2)] = filterValue;
-	  		(*h_filter_horizontal)[(r + blurKernelWidth/2)] = filterValue;
+		for (int c = -blurKernelWidth/2; c <= blurKernelWidth/2; ++c) {
+	  		float filterValue = expf( -(float)(c * c + r * r) / (2.f * blurKernelSigma * blurKernelSigma));
+	  		(*h_filter)[(r + blurKernelWidth/2) * blurKernelWidth + c + blurKernelWidth/2] = filterValue;
 	  		filterSum += filterValue;
+		}
 	}
 
 	float normalizationFactor = 1.f / filterSum;
 
-	for (int r = -blurKernelWidth/2; r <= blurKernelWidth/2; ++r) {
-	  	(*h_filter_vertical)[(r + blurKernelWidth/2)] *= normalizationFactor;
-	  	(*h_filter_horizontal)[(r + blurKernelWidth/2)] *= normalizationFactor;	  	
-	}
-
+	for (int r = -blurKernelWidth/2; r <= blurKernelWidth/2; ++r) 
+		for (int c = -blurKernelWidth/2; c <= blurKernelWidth/2; ++c) 
+	  		(*h_filter)[(r + blurKernelWidth/2) * blurKernelWidth + c + blurKernelWidth/2] *= normalizationFactor;
 }
 
 uchar4* blur_ops(uchar4* d_inputImageRGBA, size_t numRows, size_t numCols, int blurKernelWidth) { 
 	
 	float blurKernelSigma = blurKernelWidth/4.0f;
-  	//Set filter array
-	float* h_filter_vertical, *h_filter_horizontal;
+	//Set filter array
+	float* h_filter;
 	int filterWidth;
-	setFilter(&h_filter_vertical, &h_filter_horizontal, &filterWidth, blurKernelWidth, blurKernelSigma);
+	setFilter(&h_filter, &filterWidth, blurKernelWidth, blurKernelSigma);
 
 	//Set reasonable block size (i.e., number of threads per block)
-	const dim3 blockSize(16,16,1);
+	const dim3 blockSize(64,64,1);
 	//Calculate Grid SIze
 	int a=numCols/blockSize.x, b=numRows/blockSize.y;	
 	const dim3 gridSize(a+1,b+1,1);
@@ -185,7 +154,6 @@ uchar4* blur_ops(uchar4* d_inputImageRGBA, size_t numRows, size_t numCols, int b
 
 	//blurred
 	unsigned char *d_redBlurred, *d_greenBlurred, *d_blueBlurred;
-	unsigned char *d_redMid, *d_greenMid, *d_blueMid;
 	cudaMalloc(&d_redBlurred,    sizeof(unsigned char) * numPixels);
 	cudaMalloc(&d_greenBlurred,  sizeof(unsigned char) * numPixels);
 	cudaMalloc(&d_blueBlurred,   sizeof(unsigned char) * numPixels);
@@ -193,14 +161,7 @@ uchar4* blur_ops(uchar4* d_inputImageRGBA, size_t numRows, size_t numCols, int b
 	cudaMemset(d_greenBlurred, 0, sizeof(unsigned char) * numPixels);
 	cudaMemset(d_blueBlurred,  0, sizeof(unsigned char) * numPixels);
 
-	cudaMalloc(&d_redMid,    sizeof(unsigned char) * numPixels);
-	cudaMalloc(&d_greenMid,  sizeof(unsigned char) * numPixels);
-	cudaMalloc(&d_blueMid,   sizeof(unsigned char) * numPixels);
-	cudaMemset(d_redMid,   0, sizeof(unsigned char) * numPixels);
-	cudaMemset(d_greenMid, 0, sizeof(unsigned char) * numPixels);
-	cudaMemset(d_blueMid,  0, sizeof(unsigned char) * numPixels);
-
-	allocateMemoryAndCopyToGPU(numRows, numCols, h_filter_vertical, h_filter_horizontal, filterWidth);
+	allocateMemoryAndCopyToGPU(numRows, numCols, h_filter, filterWidth);
 
 	cudaEventRecord(start, 0);
 
@@ -210,13 +171,10 @@ uchar4* blur_ops(uchar4* d_inputImageRGBA, size_t numRows, size_t numCols, int b
 	cudaDeviceSynchronize(); 
 
 	//Call blur kernel here 3 times, once for each color channel.
-	gaussian_blur<<<gridSize, blockSize>>>(d_red, d_redMid, numRows, numCols,  d_filter_vertical, filterWidth);
-	gaussian_blur<<<gridSize, blockSize>>>(d_green, d_greenMid, numRows, numCols,  d_filter_vertical, filterWidth);
-	gaussian_blur<<<gridSize, blockSize>>>(d_blue, d_blueMid, numRows, numCols,  d_filter_vertical, filterWidth);
+	gaussian_blur<<<gridSize, blockSize>>>(d_red, d_redBlurred, numRows, numCols,  d_filter, filterWidth);
+	gaussian_blur<<<gridSize, blockSize>>>(d_green, d_greenBlurred, numRows, numCols,  d_filter, filterWidth);
+	gaussian_blur<<<gridSize, blockSize>>>(d_blue, d_blueBlurred, numRows, numCols,  d_filter, filterWidth);
 
-	gaussian_blur2<<<gridSize, blockSize>>>(d_redMid, d_redBlurred, numRows, numCols, d_filter_horizontal, filterWidth);
-	gaussian_blur2<<<gridSize, blockSize>>>(d_greenMid, d_greenBlurred, numRows, numCols,d_filter_horizontal, filterWidth);
-	gaussian_blur2<<<gridSize, blockSize>>>(d_blueMid, d_blueBlurred, numRows, numCols,  d_filter_horizontal, filterWidth);
 	cudaDeviceSynchronize(); 
 
 	//Now we recombine the results.
@@ -242,10 +200,6 @@ uchar4* blur_ops(uchar4* d_inputImageRGBA, size_t numRows, size_t numCols, int b
 	cudaFree(d_redBlurred);
 	cudaFree(d_greenBlurred);
 	cudaFree(d_blueBlurred);
-	cudaFree(d_redMid);
-	cudaFree(d_greenMid);
-	cudaFree(d_blueMid);
-
 
 	cudaDeviceSynchronize(); 
 
